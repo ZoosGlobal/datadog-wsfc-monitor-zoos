@@ -54,24 +54,15 @@ $ErrorActionPreference = 'Continue'
 # =============================================================================
 # SECTION 0 - Pre-Flight Checks
 # -----------------------------------------------------------------------------
-# Validates that required Windows features are installed before starting.
-# Exits with a clear, actionable error message if prerequisites are missing.
-# This prevents the script from running a silent loop with zero useful data.
-#
-# Checks performed:
-#   1. ROOT\MSCluster WMI namespace  - registered when Failover-Clustering is installed
-#   2. FailoverClusters PS module    - installed via RSAT-Clustering-PowerShell
-#   3. Cluster Service (ClusSvc)     - must be running on this node
+# Validates required Windows features before starting the collection loop.
+# Exits with actionable error messages if prerequisites are missing.
 # =============================================================================
 
 function Test-Prerequisites {
     $pass = $true
-
     Write-Host "`n[Pre-Flight] Checking prerequisites..." -ForegroundColor Cyan
 
     # Check 1 - ROOT\MSCluster WMI namespace
-    # This namespace is registered when the Failover Clustering feature is installed.
-    # If missing, Get-CimInstance throws "Invalid namespace 0x8004100e"
     try {
         $null = Get-CimInstance -Namespace ROOT\MSCluster `
                                 -ClassName  MSCluster_Cluster `
@@ -81,32 +72,24 @@ function Test-Prerequisites {
     }
     catch {
         Write-Host "  [FAIL] ROOT\MSCluster WMI namespace not found." -ForegroundColor Red
-        Write-Host "         The Failover Clustering feature is NOT installed on this node." -ForegroundColor Yellow
-        Write-Host "         Fix: Run in an elevated PowerShell session:" -ForegroundColor Yellow
-        Write-Host "              Install-WindowsFeature -Name Failover-Clustering -IncludeManagementTools" -ForegroundColor White
-        Write-Host "         Note: A reboot may be required after installation." -ForegroundColor Yellow
+        Write-Host "         Fix: Install-WindowsFeature -Name Failover-Clustering -IncludeManagementTools" -ForegroundColor Yellow
         $pass = $false
     }
 
     # Check 2 - FailoverClusters PowerShell module
-    # Required for Get-ClusterNetwork / Get-ClusterNetworkInterface cmdlets.
-    # Installed separately from the clustering feature via RSAT tools.
     if (Get-Module -ListAvailable -Name FailoverClusters) {
         Write-Host "  [OK] FailoverClusters PowerShell module is available." -ForegroundColor Green
     }
     else {
         Write-Host "  [FAIL] FailoverClusters PowerShell module not found." -ForegroundColor Red
-        Write-Host "         Fix: Run in an elevated PowerShell session:" -ForegroundColor Yellow
-        Write-Host "              Install-WindowsFeature -Name RSAT-Clustering-PowerShell" -ForegroundColor White
+        Write-Host "         Fix: Install-WindowsFeature -Name RSAT-Clustering-PowerShell" -ForegroundColor Yellow
         $pass = $false
     }
 
     # Check 3 - Cluster Service running
-    # Even if features are installed, the Cluster Service must be running.
     $svc = Get-Service -Name ClusSvc -ErrorAction SilentlyContinue
     if ($null -eq $svc) {
-        Write-Host "  [FAIL] Cluster Service (ClusSvc) not found on this node." -ForegroundColor Red
-        Write-Host "         This node may not be a cluster member." -ForegroundColor Yellow
+        Write-Host "  [FAIL] Cluster Service (ClusSvc) not found - node may not be a cluster member." -ForegroundColor Red
         $pass = $false
     }
     elseif ($svc.Status -ne 'Running') {
@@ -127,18 +110,16 @@ function Test-Prerequisites {
 # -----------------------------------------------------------------------------
 # Creates ONE persistent UDP socket at startup (reused every 60s cycle).
 #
-# FIX APPLIED: Parameter renamed from $Host -> $Hostname
-#   $Host is a PowerShell automatic/reserved variable (refers to the PS host
-#   application). Using it as a parameter name causes the error:
-#   "Cannot overwrite variable Host because it is read-only or constant."
+# NOTE: Parameter is $Hostname (NOT $Host).
+#       $Host is a reserved PowerShell automatic variable and cannot be
+#       used as a parameter name — it causes "read-only or constant" error.
 #
 # Wire format: <metric.name>:<value>|g|#tag1:val1,tag2:val2
-# Example:     wsfc.node.health:1|g|#cluster_name:prod,node_name:node01,node_state:up
 # =============================================================================
 
 function Initialize-DogStatsDClient {
     param(
-        [string] $Hostname,    # NOTE: renamed from $Host (reserved PS variable)
+        [string] $Hostname,
         [int]    $Port
     )
     $Script:UdpClient         = [System.Net.Sockets.UdpClient]::new()
@@ -155,7 +136,6 @@ function Send-Metric {
         [Parameter()]        [hashtable] $Tags = @{}
     )
 
-    # Sanitize tag keys/values - DogStatsD requires [a-zA-Z0-9_\-./] only
     $tagSegment = ''
     if ($Tags.Count -gt 0) {
         $tagParts = foreach ($kv in $Tags.GetEnumerator()) {
@@ -181,9 +161,6 @@ function Send-Metric {
 # =============================================================================
 # SECTION 2 - State Code Lookup Maps
 # -----------------------------------------------------------------------------
-# WMI returns raw integers. These maps translate them to human-readable strings
-# used as Datadog tag values - readable in dashboards without needing a legend.
-#
 # NODE STATES       0=Up | 1=Down | 2=Paused | 3=Joining
 # RESOURCE STATES   3=Online | 4=Offline | 128=Failed | ...
 # NETWORK STATES    0=Down | 1=PartiallyUp | 2=Up | 3=Unreachable
@@ -205,16 +182,11 @@ $NicStateMap     = @{ 0='unknown'; 1='unavailable'; 2='failed'; 3='unreachable';
 # =============================================================================
 # SECTION 3 - Data Collection: Cluster, Nodes, Quorum  (WMI / CIM)
 # -----------------------------------------------------------------------------
-# Queries ROOT\MSCluster WMI namespace - available on any WSFC node.
-#
-# WMI Classes used:
-#   MSCluster_Cluster       -> cluster name + quorum type
-#   MSCluster_Node          -> per-node states
-#   MSCluster_ResourceGroup -> resource groups (find Core Cluster Group)
-#   MSCluster_Resource      -> all resources (find witness resource)
-#
-# If ComputerName is provided, a CimSession is opened for remote queries.
-# The session is ALWAYS closed in the finally block (no resource leaks).
+# FIX: IsCoreGroup property is not present on all Windows Server versions.
+#      Now uses a three-level fallback to identify the Core Cluster Group:
+#        1. Try IsCoreGroup property (WS2016+)
+#        2. Try GroupType -eq 1 (CoreCluster enum value)
+#        3. Fall back to name match: group named "Cluster Group" (default name)
 # =============================================================================
 
 function Get-ClusterCimData {
@@ -243,7 +215,7 @@ function Get-ClusterCimData {
         $nodes = Get-CimInstance -Namespace ROOT\MSCluster `
                                  -ClassName  MSCluster_Node @cimArgs
 
-        # Query 3 - Resource groups (to check Core Cluster Group state)
+        # Query 3 - Resource groups (to identify Core Cluster Group)
         $groups = Get-CimInstance -Namespace ROOT\MSCluster `
                                   -ClassName  MSCluster_ResourceGroup @cimArgs
 
@@ -255,7 +227,7 @@ function Get-ClusterCimData {
         # Derived - Cluster is Up if at least one node is Up(0) or Joining(3)
         $clusterIsUp = [bool]($nodes | Where-Object { $_.State -in @(0, 3) })
 
-        # Witness detection - different quorum types use different resource types
+        # ── Witness detection ────────────────────────────────────────────────
         $witness = switch -Wildcard ($cluster.QuorumType) {
             '*File Share*' {
                 $resources | Where-Object { $_.ResourceType -like '*File Share Witness*' } |
@@ -277,7 +249,6 @@ function Get-ClusterCimData {
             }
         }
 
-        # Extract witness details (default 'none' if no witness configured)
         $wState = 'none'; $wType = 'none'; $wName = 'none'; $wOwner = 'none'
         if ($null -ne $witness) {
             $wCode  = [int]$witness.State
@@ -289,9 +260,48 @@ function Get-ClusterCimData {
             } else { 'none' }
         }
 
-        # Core Cluster Group - hosts Cluster Name + IP resources
-        # If Offline or Failed, the cluster is functionally down
-        $coreGroup      = $groups | Where-Object { $_.IsCoreGroup } | Select-Object -First 1
+        # ── Core Cluster Group detection (three-level fallback) ──────────────
+        #
+        # Level 1: IsCoreGroup property (available on WS2016+)
+        #   - Most reliable when available
+        #
+        # Level 2: GroupType -eq 1
+        #   - GroupType 1 = CoreCluster in MSCluster_ResourceGroup
+        #   - Available on older Windows Server versions
+        #
+        # Level 3: Name match
+        #   - Default name of Core Group is always "Cluster Group"
+        #   - Fallback for environments where neither property exists
+        #
+        $coreGroup = $null
+
+        # Level 1 - try IsCoreGroup
+        try {
+            $coreGroup = $groups | Where-Object { $_.IsCoreGroup -eq $true } |
+                         Select-Object -First 1
+        }
+        catch {
+            Write-Verbose '[Get-ClusterCimData] IsCoreGroup property not available, trying GroupType.'
+        }
+
+        # Level 2 - try GroupType
+        if ($null -eq $coreGroup) {
+            try {
+                $coreGroup = $groups | Where-Object { [int]$_.GroupType -eq 1 } |
+                             Select-Object -First 1
+            }
+            catch {
+                Write-Verbose '[Get-ClusterCimData] GroupType property not available, falling back to name match.'
+            }
+        }
+
+        # Level 3 - name-based fallback
+        if ($null -eq $coreGroup) {
+            $coreGroup = $groups | Where-Object {
+                $_.Name -like '*Cluster Group*' -or $_.Name -like '*Core*'
+            } | Select-Object -First 1
+        }
+
         $coreGroupState = 'not_found'
         if ($null -ne $coreGroup) {
             $cgCode         = [int]$coreGroup.State
@@ -326,13 +336,38 @@ function Get-ClusterCimData {
 # =============================================================================
 # SECTION 4 - Data Collection: Networks & Interfaces  (FailoverClusters module)
 # -----------------------------------------------------------------------------
-# Uses two cmdlets from the FailoverClusters PS module:
-#   Get-ClusterNetwork          -> one object per network segment
-#   Get-ClusterNetworkInterface -> one object per NIC per node per network
+# FIX 1: Get-ClusterNetworkInterface pipeline crash
+#   On some Windows Server / cluster versions, accessing $_.Node.Name and
+#   $_.Network.Name inside ForEach-Object throws "property Name not found"
+#   which stops the entire pipeline with "The pipeline has been stopped."
+#   Fix: Use a safe helper function (Get-PropertyValue) that handles all cases:
+#     - Object with .Name property  (newer versions)
+#     - Plain string value           (older versions)
+#     - Null / missing               (graceful fallback)
 #
-# .State returns an enum - cast to [int] for consistent map lookup.
-# .Node and .Network are embedded objects - extract .Name as plain string.
+# FIX 2: Cluster name resolution
+#   Get-Cluster returns a Cluster object. Wrapping in try/catch and using
+#   multiple fallback property names for safety.
 # =============================================================================
+
+# Safe property reader - handles object, string, and missing property cases
+function Get-PropertyValue {
+    param(
+        [object] $Obj,
+        [string[]] $PropertyNames,   # try these property names in order
+        [string] $Fallback = 'unknown'
+    )
+    foreach ($prop in $PropertyNames) {
+        try {
+            $val = $Obj.$prop
+            if ($null -ne $val -and "$val" -ne '') {
+                return "$val"
+            }
+        }
+        catch { <# property doesn't exist on this object type, try next #> }
+    }
+    return $Fallback
+}
 
 function Get-ClusterNetworkData {
     param([string] $ComputerName = '')
@@ -343,33 +378,55 @@ function Get-ClusterNetworkData {
         $clusterArgs = @{}
         if ($ComputerName -and $ComputerName -ne '') { $clusterArgs.Cluster = $ComputerName }
 
-        $clusterName = Get-Cluster @clusterArgs -ErrorAction Stop |
-                       Select-Object -ExpandProperty Name -First 1
+        # Get cluster name safely
+        $clusterObj  = Get-Cluster @clusterArgs -ErrorAction Stop | Select-Object -First 1
+        $clusterName = Get-PropertyValue -Obj $clusterObj -PropertyNames 'Name' -Fallback 'unknown-cluster'
 
-        # Network segments (e.g. "Cluster-Network-1", "Heartbeat-Network")
-        $networks = Get-ClusterNetwork @clusterArgs | ForEach-Object {
-            $stateInt = try { [int]$_.State } catch { -1 }
-            [pscustomobject]@{
-                Name       = [string]$_.Name
-                StateCode  = $stateInt
-                StateLabel = if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
-                Role       = ($_.Role).ToString().ToLower()
-                Metric     = [int]$_.Metric
-            }
-        }
+        # ── Network segments ──────────────────────────────────────────────────
+        $networks = Get-ClusterNetwork @clusterArgs -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        $stateInt = try { [int]$_.State } catch { -1 }
+                        [pscustomobject]@{
+                            Name       = [string]$_.Name
+                            StateCode  = $stateInt
+                            StateLabel = if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
+                            Role       = try { ($_.Role).ToString().ToLower() } catch { 'unknown' }
+                            Metric     = try { [int]$_.Metric } catch { 0 }
+                        }
+                    }
 
-        # NIC per node per network (e.g. "NODE01 - Ethernet0")
-        $interfaces = Get-ClusterNetworkInterface @clusterArgs | ForEach-Object {
-            $stateInt = try { [int]$_.State } catch { -1 }
-            [pscustomobject]@{
-                Name       = [string]$_.Name
-                Node       = [string]$_.Node.Name      # plain string - not the embedded object
-                Network    = [string]$_.Network.Name   # plain string - not the embedded object
-                Adapter    = [string]$_.Adapter
-                StateCode  = $stateInt
-                StateLabel = if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
-            }
-        }
+        # ── Network interfaces ────────────────────────────────────────────────
+        # FIX: .Node and .Network can be either:
+        #   (a) An embedded cluster object with a .Name property  → use .Node.Name
+        #   (b) A plain string                                    → use directly
+        # Get-PropertyValue handles both cases safely without crashing the pipeline.
+        $interfaces = Get-ClusterNetworkInterface @clusterArgs -ErrorAction SilentlyContinue |
+                      ForEach-Object {
+                          $stateInt = try { [int]$_.State } catch { -1 }
+
+                          # Resolve node name - try .Node.Name (object) then .Node (string)
+                          $nodeName = try {
+                              $n = $_.Node
+                              if ($n -is [string]) { $n }
+                              else { Get-PropertyValue -Obj $n -PropertyNames 'Name' -Fallback 'unknown' }
+                          } catch { 'unknown' }
+
+                          # Resolve network name - try .Network.Name (object) then .Network (string)
+                          $networkName = try {
+                              $nw = $_.Network
+                              if ($nw -is [string]) { $nw }
+                              else { Get-PropertyValue -Obj $nw -PropertyNames 'Name' -Fallback 'unknown' }
+                          } catch { 'unknown' }
+
+                          [pscustomobject]@{
+                              Name       = [string]$_.Name
+                              Node       = $nodeName
+                              Network    = $networkName
+                              Adapter    = try { [string]$_.Adapter } catch { 'unknown' }
+                              StateCode  = $stateInt
+                              StateLabel = if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
+                          }
+                      }
 
         return [pscustomobject]@{
             ClusterName = $clusterName
@@ -389,12 +446,12 @@ function Get-ClusterNetworkData {
 # Converts collected data into Datadog gauge metrics and sends via DogStatsD.
 #
 # Two metrics per component:
-#   wsfc.*.health -> binary 1/0  - used by monitors (threshold < 1 = alert)
-#   wsfc.*.state  -> raw code    - used in dashboards for trend/state-change graphs
+#   wsfc.*.health -> binary 1/0   - used by Datadog monitors (threshold < 1 = alert)
+#   wsfc.*.state  -> raw int code - used in dashboards for trend/state-change graphs
 #
-# Quorum context (type, witness name/type/state/owner) sent as TAGS on
-# wsfc.quorum.witness.health - not as separate metrics - to keep custom
-# metric count low while keeping all data queryable in Datadog.
+# Quorum context (type, witness details) carried as tags on wsfc.quorum.witness.health
+# rather than separate metrics - keeps custom metric count low while retaining
+# full filterability in Datadog dashboards.
 # =============================================================================
 
 function Submit-WSFCMetrics {
@@ -402,15 +459,12 @@ function Submit-WSFCMetrics {
 
     Write-Host "[$([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))] Collecting WSFC metrics..." -ForegroundColor DarkCyan
 
-    # -------------------------------------------------------------------------
-    # 5A - Cluster Health, Node Health, Quorum  (from WMI)
-    # -------------------------------------------------------------------------
+    # ── 5A: Cluster, Node, Quorum ─────────────────────────────────────────────
     $clusterData = Get-ClusterCimData -ComputerName $ComputerName
 
     if ($null -ne $clusterData) {
         $cn = ($clusterData.ClusterName -replace '[^a-zA-Z0-9_\-]','_').ToLower()
 
-        # Common tags shared by all cluster-scope metrics
         $clusterTags = @{
             cluster_name     = $cn
             quorum_type      = $clusterData.QuorumType
@@ -422,14 +476,12 @@ function Submit-WSFCMetrics {
                     -Value ([int][bool]$clusterData.ClusterIsUp) `
                     -Tags  $clusterTags
 
-        # wsfc.cluster.nodes.up / down / paused - aggregate counts
-        # nodes.down >= 1 is an early warning before quorum is lost
+        # wsfc.cluster.nodes.up / down / paused
         Send-Metric -Name 'wsfc.cluster.nodes.up'     -Value $clusterData.NodesUp     -Tags $clusterTags
         Send-Metric -Name 'wsfc.cluster.nodes.down'   -Value $clusterData.NodesDown   -Tags $clusterTags
         Send-Metric -Name 'wsfc.cluster.nodes.paused' -Value $clusterData.NodesPaused -Tags $clusterTags
 
         # wsfc.quorum.witness.health - 1=Online, 0=Offline/Failed/None
-        # All quorum context travels as tags - not as separate metrics
         $witnessHealth = if ($clusterData.WitnessState -eq 'online') { 1 } else { 0 }
         Send-Metric -Name 'wsfc.quorum.witness.health' `
                     -Value $witnessHealth `
@@ -455,43 +507,30 @@ function Submit-WSFCMetrics {
                 node_state   = $stateLabel
             }
 
-            # wsfc.node.health: 1=Up only | 0=Down/Paused/Joining/Unknown
             Send-Metric -Name 'wsfc.node.health' -Value ([int]($stateCode -eq 0)) -Tags $nodeTags
-
-            # wsfc.node.state: 0=Up | 1=Down | 2=Paused | 3=Joining
             Send-Metric -Name 'wsfc.node.state'  -Value $stateCode                -Tags $nodeTags
         }
     }
 
-    # -------------------------------------------------------------------------
-    # 5B - Network Health & Interface Health  (from FailoverClusters module)
-    # -------------------------------------------------------------------------
+    # ── 5B: Network, Interface ────────────────────────────────────────────────
     $netData = Get-ClusterNetworkData -ComputerName $ComputerName
 
     if ($null -ne $netData) {
         $cn = ($netData.ClusterName -replace '[^a-zA-Z0-9_\-]','_').ToLower()
 
-        # wsfc.network.health / state / metric - per network segment
         foreach ($net in $netData.Networks) {
             $netName = ($net.Name -replace '[^a-zA-Z0-9_\-]','_').ToLower()
             $netTags = @{
                 cluster_name  = $cn
                 network_name  = $netName
-                network_role  = $net.Role        # cluster_and_client / cluster / none
+                network_role  = $net.Role
                 network_state = $net.StateLabel
             }
-
-            # wsfc.network.health: 1=Up (StateCode 2 only) | 0=Down/PartiallyUp/Unreachable
             Send-Metric -Name 'wsfc.network.health' -Value ([int]($net.StateCode -eq 2)) -Tags $netTags
-
-            # wsfc.network.state: 0=Down | 1=PartiallyUp | 2=Up | 3=Unreachable
             Send-Metric -Name 'wsfc.network.state'  -Value $net.StateCode               -Tags $netTags
-
-            # wsfc.network.metric: route preference - lower = more preferred path
             Send-Metric -Name 'wsfc.network.metric' -Value $net.Metric                  -Tags $netTags
         }
 
-        # wsfc.network_interface.health / state - per NIC per node
         foreach ($nic in $netData.Interfaces) {
             $nicName   = ($nic.Name    -replace '[^a-zA-Z0-9_\-]','_').ToLower()
             $nodeName  = ($nic.Node    -replace '[^a-zA-Z0-9_\-]','_').ToLower()
@@ -507,10 +546,7 @@ function Submit-WSFCMetrics {
                 interface_state = $nic.StateLabel
             }
 
-            # wsfc.network_interface.health: 1=Up (StateCode 4 only) | 0=anything else
             Send-Metric -Name 'wsfc.network_interface.health' -Value ([int]($nic.StateCode -eq 4)) -Tags $nicTags
-
-            # wsfc.network_interface.state: 0=Unknown|1=Unavailable|2=Failed|3=Unreachable|4=Up
             Send-Metric -Name 'wsfc.network_interface.state'  -Value $nic.StateCode               -Tags $nicTags
         }
     }
@@ -521,28 +557,21 @@ function Submit-WSFCMetrics {
 # =============================================================================
 # SECTION 6 - Entry Point / 60-Second Run Loop
 # -----------------------------------------------------------------------------
-# Pre-flight check runs first - exits cleanly if prerequisites are not met.
-#
-# The run loop uses a Stopwatch to maintain exactly 60-second intervals:
-#   Sleep = 60000ms - actual_collection_time_ms
-# This ensures consistent metric intervals regardless of WMI query duration.
-#
-# UDP client is always disposed in the finally block (Ctrl+C or any error).
+# Pre-flight runs first - exits if prerequisites are missing.
+# Stopwatch compensates for collection time to maintain exact 60s intervals.
+# UDP client is always disposed in the finally block.
 # =============================================================================
 
-# Run pre-flight checks - abort if this node is not cluster-ready
 if (-not (Test-Prerequisites)) {
     Write-Host "[WSFC Monitor] Prerequisites not met. Please fix the issues above and re-run." -ForegroundColor Red
     Write-Host ""
-    Write-Host "Quick fix commands (run in an elevated PowerShell window):" -ForegroundColor Yellow
+    Write-Host "Quick fix commands (elevated PowerShell):" -ForegroundColor Yellow
     Write-Host "  Install-WindowsFeature -Name Failover-Clustering -IncludeManagementTools" -ForegroundColor White
     Write-Host "  Install-WindowsFeature -Name RSAT-Clustering-PowerShell" -ForegroundColor White
-    Write-Host "  Restart-Computer  # if prompted after feature install" -ForegroundColor White
+    Write-Host "  Restart-Computer" -ForegroundColor White
     exit 1
 }
 
-# Initialise UDP client
-# NOTE: Using $Hostname parameter (not $Host which is a reserved PS variable)
 Initialize-DogStatsDClient -Hostname $DogStatsDHost -Port $DogStatsDPort
 
 try {
@@ -554,11 +583,8 @@ try {
         Write-Host '[WSFC Monitor] Running every 60 seconds. Press Ctrl+C to stop.' -ForegroundColor Cyan
         while ($true) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
-
             Submit-WSFCMetrics -ComputerName $ComputerName
-
             $sw.Stop()
-            # Sleep for remainder of 60s window - compensates for collection time
             $sleepMs = [Math]::Max(0, 60000 - $sw.ElapsedMilliseconds)
             Write-Verbose "[Scheduler] Collection took $($sw.ElapsedMilliseconds)ms. Sleeping $([Math]::Round($sleepMs/1000,1))s."
             Start-Sleep -Milliseconds $sleepMs
