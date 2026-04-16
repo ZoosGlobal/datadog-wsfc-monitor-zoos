@@ -10,7 +10,7 @@
       - All cluster node state / health / weight
       - Cluster role/group state / health / owner
       - Cluster resource state / health / owner
-      - Cluster Shared Volumes (CSV) state / owner
+      - Cluster Shared Volumes (CSV) state / owner / size
       - Quorum / witness
       - Networks / interfaces
 #>
@@ -41,7 +41,8 @@ function Read-Prop {
         try {
             $v = $Obj.$n
             if ($null -ne $v -and "$v" -ne '') { return "$v" }
-        } catch {}
+        }
+        catch { }
     }
     return $Default
 }
@@ -90,8 +91,7 @@ function Initialize-DogStatsDClient {
 }
 
 function Test-Prerequisites {
-    $hasModule = [bool](Get-Module -ListAvailable -Name FailoverClusters)
-    if (-not $hasModule) {
+    if (-not (Get-Module -ListAvailable -Name FailoverClusters)) {
         Write-Host "[FAIL] FailoverClusters module not found." -ForegroundColor Red
         return $false
     }
@@ -175,41 +175,77 @@ function Get-ClusterNetworkData {
         Import-Module FailoverClusters -ErrorAction Stop
 
         $clusterArgs = @{}
-        if ($ComputerName -and $ComputerName -ne '') { $clusterArgs.Cluster = $ComputerName }
+        if ($ComputerName -and $ComputerName -ne '') {
+            $clusterArgs.Cluster = $ComputerName
+        }
 
         $clusterObj = Get-Cluster @clusterArgs -ErrorAction Stop | Select-Object -First 1
         $clusterName = Read-Prop -Obj $clusterObj -Names 'Name' -Default 'unknown-cluster'
 
-        $networks = @(Get-ClusterNetwork @clusterArgs -ErrorAction SilentlyContinue) | ForEach-Object {
-            $stateInt = try { [int]$_.State } catch { -1 }
-            [pscustomobject]@{
-                Name       = try { [string]$_.Name } catch { 'unknown' }
+        $networkItems = @()
+        $rawNetworks = @(Get-ClusterNetwork @clusterArgs -ErrorAction SilentlyContinue)
+        foreach ($net in $rawNetworks) {
+            $stateInt = try { [int]$net.State } catch { -1 }
+            $netName = try { [string]$net.Name } catch { 'unknown' }
+            $roleVal = try { ($net.Role).ToString().ToLower() } catch { 'unknown' }
+            $metricVal = try { [int]$net.Metric } catch { 0 }
+
+            $stateLabel = if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
+
+            $networkItems += [pscustomobject]@{
+                Name       = $netName
                 StateCode  = $stateInt
-                StateLabel = if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
-                Role       = try { ($_.Role).ToString().ToLower() } catch { 'unknown' }
-                Metric     = try { [int]$_.Metric } catch { 0 }
+                StateLabel = $stateLabel
+                Role       = $roleVal
+                Metric     = $metricVal
             }
         }
 
-        $interfaces = @(Get-ClusterNetworkInterface @clusterArgs -ErrorAction SilentlyContinue) | ForEach-Object {
-            $stateInt = try { [int]$_.State } catch { -1 }
-            $nodeRaw = try { $_.Node } catch { $null }
-            $netRaw  = try { $_.Network } catch { $null }
+        $interfaceItems = @()
+        $rawInterfaces = @(Get-ClusterNetworkInterface @clusterArgs -ErrorAction SilentlyContinue)
+        foreach ($nic in $rawInterfaces) {
+            $stateInt = try { [int]$nic.State } catch { -1 }
+            $nicName = try { [string]$nic.Name } catch { 'unknown' }
+            $adapterVal = try { [string]$nic.Adapter } catch { 'unknown' }
 
-            [pscustomobject]@{
-                Name       = try { [string]$_.Name } catch { 'unknown' }
-                Node       = if ($null -eq $nodeRaw) { 'unknown' } elseif ($nodeRaw -is [string]) { $nodeRaw } else { Read-Prop -Obj $nodeRaw -Names 'Name' -Default 'unknown' }
-                Network    = if ($null -eq $netRaw) { 'unknown' } elseif ($netRaw -is [string]) { $netRaw } else { Read-Prop -Obj $netRaw -Names 'Name' -Default 'unknown' }
-                Adapter    = try { [string]$_.Adapter } catch { 'unknown' }
+            $nodeRaw = try { $nic.Node } catch { $null }
+            if ($null -eq $nodeRaw) {
+                $nodeName = 'unknown'
+            }
+            elseif ($nodeRaw -is [string]) {
+                $nodeName = $nodeRaw
+            }
+            else {
+                $nodeName = Read-Prop -Obj $nodeRaw -Names 'Name' -Default 'unknown'
+            }
+
+            $netRaw = try { $nic.Network } catch { $null }
+            if ($null -eq $netRaw) {
+                $netName = 'unknown'
+            }
+            elseif ($netRaw -is [string]) {
+                $netName = $netRaw
+            }
+            else {
+                $netName = Read-Prop -Obj $netRaw -Names 'Name' -Default 'unknown'
+            }
+
+            $stateLabel = if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
+
+            $interfaceItems += [pscustomobject]@{
+                Name       = $nicName
+                Node       = $nodeName
+                Network    = $netName
+                Adapter    = $adapterVal
                 StateCode  = $stateInt
-                StateLabel = if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
+                StateLabel = $stateLabel
             }
         }
 
         return [pscustomobject]@{
             ClusterName = $clusterName
-            Networks    = @($networks)
-            Interfaces  = @($interfaces)
+            Networks    = $networkItems
+            Interfaces  = $interfaceItems
         }
     }
     catch {
@@ -224,17 +260,21 @@ function Get-ClusterCsvData {
         Import-Module FailoverClusters -ErrorAction Stop
 
         $clusterArgs = @{}
-        if ($ComputerName -and $ComputerName -ne '') { $clusterArgs.Cluster = $ComputerName }
+        if ($ComputerName -and $ComputerName -ne '') {
+            $clusterArgs.Cluster = $ComputerName
+        }
 
         $csvs = @(Get-ClusterSharedVolume @clusterArgs -ErrorAction SilentlyContinue)
+        $items = @()
 
-        $items = foreach ($csv in $csvs) {
+        foreach ($csv in $csvs) {
             $csvName = try { [string]$csv.Name } catch { 'unknown' }
             $csvState = try { [string]$csv.State } catch { 'unknown' }
             $ownerNode = try { [string]$csv.OwnerNode } catch { 'unknown' }
 
             $sharedVol = $null
             try { $sharedVol = $csv.SharedVolumeInfo } catch {}
+
             $path = 'unknown'
             $sizeGB = -1
             $freeGB = -1
@@ -242,12 +282,21 @@ function Get-ClusterCsvData {
 
             if ($null -ne $sharedVol) {
                 try { $path = [string]$sharedVol.FriendlyVolumeName } catch {}
-                try { $part = $sharedVol.Partition; if ($part) { $sizeGB = [math]::Round(($part.Size / 1GB), 2) } } catch {}
-                try { $part = $sharedVol.Partition; if ($part) { $freeGB = [math]::Round(($part.FreeSpace / 1GB), 2) } } catch {}
-                try { $part = $sharedVol.Partition; if ($part) { $percentFree = [math]::Round($part.PercentFree, 2) } } catch {}
+                try {
+                    $part = $sharedVol.Partition
+                    if ($part) { $sizeGB = [math]::Round(($part.Size / 1GB), 2) }
+                } catch {}
+                try {
+                    $part = $sharedVol.Partition
+                    if ($part) { $freeGB = [math]::Round(($part.FreeSpace / 1GB), 2) }
+                } catch {}
+                try {
+                    $part = $sharedVol.Partition
+                    if ($part -and $part.Size -gt 0) { $percentFree = [math]::Round(($part.FreeSpace / $part.Size) * 100, 2) }
+                } catch {}
             }
 
-            [pscustomobject]@{
+            $items += [pscustomobject]@{
                 Name        = $csvName
                 State       = $csvState
                 OwnerNode   = $ownerNode
@@ -258,7 +307,7 @@ function Get-ClusterCsvData {
             }
         }
 
-        return @($items)
+        return $items
     }
     catch {
         return @()
@@ -278,19 +327,23 @@ function Submit-WSFCMetrics {
     $clusterTags = @{ cluster_name = $cn; quorum_type = $clusterData.QuorumType }
 
     Send-Metric -Name 'wsfc.cluster.present' -Value 1 -Tags $clusterTags
-    Send-Metric -Name 'wsfc.cluster.health'  -Value ([int][bool]$clusterData.ClusterIsUp) -Tags $clusterTags
-    Send-Metric -Name 'wsfc.cluster.state'   -Value ([int][bool]$clusterData.ClusterIsUp) -Tags $clusterTags
+    Send-Metric -Name 'wsfc.cluster.health' -Value ([int][bool]$clusterData.ClusterIsUp) -Tags $clusterTags
+    Send-Metric -Name 'wsfc.cluster.state'  -Value ([int][bool]$clusterData.ClusterIsUp) -Tags $clusterTags
 
-    Send-Metric -Name 'wsfc.cluster.nodes.up'     -Value (@($clusterData.Nodes | Where-Object { $_.State -eq 0 }).Count) -Tags $clusterTags
-    Send-Metric -Name 'wsfc.cluster.nodes.down'   -Value (@($clusterData.Nodes | Where-Object { $_.State -eq 1 }).Count) -Tags $clusterTags
-    Send-Metric -Name 'wsfc.cluster.nodes.paused' -Value (@($clusterData.Nodes | Where-Object { $_.State -eq 2 }).Count) -Tags $clusterTags
+    $nodesUp = @($clusterData.Nodes | Where-Object { $_.State -eq 0 }).Count
+    $nodesDown = @($clusterData.Nodes | Where-Object { $_.State -eq 1 }).Count
+    $nodesPaused = @($clusterData.Nodes | Where-Object { $_.State -eq 2 }).Count
+
+    Send-Metric -Name 'wsfc.cluster.nodes.up' -Value $nodesUp -Tags $clusterTags
+    Send-Metric -Name 'wsfc.cluster.nodes.down' -Value $nodesDown -Tags $clusterTags
+    Send-Metric -Name 'wsfc.cluster.nodes.paused' -Value $nodesPaused -Tags $clusterTags
 
     if ($clusterData.Witness) {
         $w = $clusterData.Witness
         $wCode = try { [int]$w.State } catch { -1 }
         $wState = if ($ResStateMap.ContainsKey($wCode)) { $ResStateMap[$wCode] } else { 'unknown' }
 
-        Send-Metric -Name 'wsfc.quorum.witness.health' -Value ([int]($wState -eq 'online')) -Tags @{
+        $wTags = @{
             cluster_name       = $cn
             quorum_type        = $clusterData.QuorumType
             quorum_type_value  = [string]$clusterData.QuorumTypeValue
@@ -299,13 +352,20 @@ function Submit-WSFCMetrics {
             witness_state      = $wState
             witness_owner_node = Sanitize-TagValue $w.OwnerNode
         }
+
+        if ($wState -eq 'online') {
+            Send-Metric -Name 'wsfc.quorum.witness.health' -Value 1 -Tags $wTags
+        }
+        else {
+            Send-Metric -Name 'wsfc.quorum.witness.health' -Value 0 -Tags $wTags
+        }
     }
 
     foreach ($node in $clusterData.Nodes) {
         $stateCode = try { [int]$node.State } catch { -1 }
         $stateLabel = if ($NodeStateMap.ContainsKey($stateCode)) { $NodeStateMap[$stateCode] } else { 'unknown' }
-        $nodeName   = Sanitize-TagValue $node.Name
-        $nodeWeight  = try { [int]$node.NodeWeight } catch { -1 }
+        $nodeName = Sanitize-TagValue $node.Name
+        $nodeWeight = try { [int]$node.NodeWeight } catch { -1 }
 
         $nodeTags = @{
             cluster_name = $cn
@@ -313,7 +373,13 @@ function Submit-WSFCMetrics {
             node_state   = $stateLabel
         }
 
-        Send-Metric -Name 'wsfc.node.health' -Value ([int]($stateCode -eq 0)) -Tags $nodeTags
+        if ($stateCode -eq 0) {
+            Send-Metric -Name 'wsfc.node.health' -Value 1 -Tags $nodeTags
+        }
+        else {
+            Send-Metric -Name 'wsfc.node.health' -Value 0 -Tags $nodeTags
+        }
+
         Send-Metric -Name 'wsfc.node.state'  -Value $stateCode -Tags $nodeTags
         Send-Metric -Name 'wsfc.node.weight'  -Value $nodeWeight -Tags $nodeTags
     }
@@ -331,15 +397,21 @@ function Submit-WSFCMetrics {
             role_state   = $groupStateLabel
         }
 
-        Send-Metric -Name 'wsfc.role.health' -Value ([int]($groupStateCode -eq 3)) -Tags $groupTags
-        Send-Metric -Name 'wsfc.role.state'  -Value $groupStateCode -Tags $groupTags
+        if ($groupStateCode -eq 3) {
+            Send-Metric -Name 'wsfc.role.health' -Value 1 -Tags $groupTags
+        }
+        else {
+            Send-Metric -Name 'wsfc.role.health' -Value 0 -Tags $groupTags
+        }
+
+        Send-Metric -Name 'wsfc.role.state' -Value $groupStateCode -Tags $groupTags
     }
 
     foreach ($res in $clusterData.Resources) {
         $resName = Sanitize-TagValue $res.Name
         $ownerGroup = Sanitize-TagValue (Read-Prop -Obj $res -Names 'OwnerGroup' -Default 'unknown')
-        $ownerNode  = Sanitize-TagValue (Read-Prop -Obj $res -Names 'OwnerNode' -Default 'unknown')
-        $resType    = Sanitize-TagValue (Read-Prop -Obj $res -Names 'ResourceType' -Default 'unknown')
+        $ownerNode = Sanitize-TagValue (Read-Prop -Obj $res -Names 'OwnerNode' -Default 'unknown')
+        $resType = Sanitize-TagValue (Read-Prop -Obj $res -Names 'ResourceType' -Default 'unknown')
         $resStateCode = try { [int]$res.State } catch { -1 }
         $resStateLabel = if ($ResStateMap.ContainsKey($resStateCode)) { $ResStateMap[$resStateCode] } else { 'unknown' }
 
@@ -352,26 +424,39 @@ function Submit-WSFCMetrics {
             resource_state = $resStateLabel
         }
 
-        Send-Metric -Name 'wsfc.resource.health' -Value ([int]($resStateCode -eq 3)) -Tags $resTags
-        Send-Metric -Name 'wsfc.resource.state'  -Value $resStateCode -Tags $resTags
+        if ($resStateCode -eq 3) {
+            Send-Metric -Name 'wsfc.resource.health' -Value 1 -Tags $resTags
+        }
+        else {
+            Send-Metric -Name 'wsfc.resource.health' -Value 0 -Tags $resTags
+        }
+
+        Send-Metric -Name 'wsfc.resource.state' -Value $resStateCode -Tags $resTags
     }
 
-    foreach ($csv in (Get-ClusterCsvData -ComputerName $ComputerName)) {
+    $csvItems = @(Get-ClusterCsvData -ComputerName $ComputerName)
+    foreach ($csv in $csvItems) {
         $csvName = Sanitize-TagValue $csv.Name
         $csvOwner = Sanitize-TagValue $csv.OwnerNode
-        $csvState = Sanitize-TagValue $csv.State
+        $csvStateText = Sanitize-TagValue $csv.State
 
         $csvTags = @{
             cluster_name = $cn
             csv_name     = $csvName
             owner_node   = $csvOwner
-            csv_state    = $csvState
+            csv_state    = $csvStateText
         }
 
-        Send-Metric -Name 'wsfc.csv.health'      -Value ([int]($csv.State -eq 'Online')) -Tags $csvTags
-        Send-Metric -Name 'wsfc.csv.state'       -Value ([int]([string]::IsNullOrWhiteSpace($csv.State) ? -1 : 0)) -Tags $csvTags
-        Send-Metric -Name 'wsfc.csv.free_gb'     -Value ([double]$csv.FreeGB) -Tags $csvTags
-        Send-Metric -Name 'wsfc.csv.size_gb'     -Value ([double]$csv.SizeGB) -Tags $csvTags
+        $csvHealth = 0
+        if ($csv.State -eq 'Online') { $csvHealth = 1 }
+
+        $csvStateCode = -1
+        if (-not [string]::IsNullOrWhiteSpace($csv.State)) { $csvStateCode = 0 }
+
+        Send-Metric -Name 'wsfc.csv.health'       -Value $csvHealth -Tags $csvTags
+        Send-Metric -Name 'wsfc.csv.state'        -Value $csvStateCode -Tags $csvTags
+        Send-Metric -Name 'wsfc.csv.size_gb'      -Value ([double]$csv.SizeGB) -Tags $csvTags
+        Send-Metric -Name 'wsfc.csv.free_gb'      -Value ([double]$csv.FreeGB) -Tags $csvTags
         Send-Metric -Name 'wsfc.csv.percent_free' -Value ([double]$csv.PercentFree) -Tags $csvTags
     }
 
@@ -380,8 +465,12 @@ function Submit-WSFCMetrics {
         $cn2 = Sanitize-TagValue $netData.ClusterName
 
         foreach ($net in $netData.Networks) {
-            $netName = Sanitize-TagValue $net.Name
-            $netTags = @{ cluster_name = $cn2; network_name = $netName; network_role = $net.Role; network_state = $net.StateLabel }
+            $netTags = @{
+                cluster_name = $cn2
+                network_name = Sanitize-TagValue $net.Name
+                network_role = $net.Role
+                network_state = $net.StateLabel
+            }
             Send-Metric -Name 'wsfc.network.health' -Value ([int]($net.StateCode -eq 2)) -Tags $netTags
             Send-Metric -Name 'wsfc.network.state'  -Value $net.StateCode -Tags $netTags
             Send-Metric -Name 'wsfc.network.metric'  -Value $net.Metric -Tags $netTags
@@ -399,54 +488,6 @@ function Submit-WSFCMetrics {
             Send-Metric -Name 'wsfc.network_interface.health' -Value ([int]($nic.StateCode -eq 4)) -Tags $nicTags
             Send-Metric -Name 'wsfc.network_interface.state'  -Value $nic.StateCode -Tags $nicTags
         }
-    }
-}
-
-function Get-ClusterNetworkData {
-    param([string] $ComputerName = '')
-
-    try {
-        Import-Module FailoverClusters -ErrorAction Stop
-        $clusterArgs = @{}
-        if ($ComputerName -and $ComputerName -ne '') { $clusterArgs.Cluster = $ComputerName }
-
-        $clusterObj = Get-Cluster @clusterArgs -ErrorAction Stop | Select-Object -First 1
-        $clusterName = Read-Prop -Obj $clusterObj -Names 'Name' -Default 'unknown-cluster'
-
-        $networks = @(Get-ClusterNetwork @clusterArgs -ErrorAction SilentlyContinue) | ForEach-Object {
-            $stateInt = try { [int]$_.State } catch { -1 }
-            [pscustomobject]@{
-                Name       = try { [string]$_.Name } catch { 'unknown' }
-                StateCode  = $stateInt
-                StateLabel = if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
-                Role       = try { ($_.Role).ToString().ToLower() } catch { 'unknown' }
-                Metric     = try { [int]$_.Metric } catch { 0 }
-            }
-        }
-
-        $interfaces = @(Get-ClusterNetworkInterface @clusterArgs -ErrorAction SilentlyContinue) | ForEach-Object {
-            $stateInt = try { [int]$_.State } catch { -1 }
-            $nodeRaw = try { $_.Node } catch { $null }
-            $netRaw  = try { $_.Network } catch { $null }
-
-            [pscustomobject]@{
-                Name       = try { [string]$_.Name } catch { 'unknown' }
-                Node       = if ($null -eq $nodeRaw) { 'unknown' } elseif ($nodeRaw -is [string]) { $nodeRaw } else { Read-Prop -Obj $nodeRaw -Names 'Name' -Default 'unknown' }
-                Network    = if ($null -eq $netRaw) { 'unknown' } elseif ($netRaw -is [string]) { $netRaw } else { Read-Prop -Obj $netRaw -Names 'Name' -Default 'unknown' }
-                Adapter    = try { [string]$_.Adapter } catch { 'unknown' }
-                StateCode  = $stateInt
-                StateLabel = if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
-            }
-        }
-
-        return [pscustomobject]@{
-            ClusterName = $clusterName
-            Networks    = @($networks)
-            Interfaces  = @($interfaces)
-        }
-    }
-    catch {
-        return $null
     }
 }
 
