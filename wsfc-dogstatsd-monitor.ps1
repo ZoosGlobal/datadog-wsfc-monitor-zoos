@@ -5,22 +5,15 @@
 
 .DESCRIPTION
     Collects Windows Server Failover Cluster metrics and sends them to DogStatsD.
-    Designed to run once per scheduled-task invocation.
-    Monitors:
-      - Cluster presence / health
-      - All cluster node state / health / weight
-      - Cluster role/group state / health / owner
-      - Cluster resource state / health / owner
-      - Cluster Shared Volumes (CSV) state / owner / size
-      - Quorum / witness
-      - Networks / interfaces
+    Designed to run once per invocation.
 #>
 
 [CmdletBinding()]
 param(
     [string] $DogStatsDHost = '127.0.0.1',
     [int]    $DogStatsDPort = 8125,
-    [string] $ComputerName  = ''
+    [string] $ComputerName  = '',
+    [switch] $RunOnce
 )
 
 Set-StrictMode -Version Latest
@@ -189,7 +182,6 @@ function Get-ClusterNetworkData {
             $netName = try { [string]$net.Name } catch { 'unknown' }
             $roleVal = try { ($net.Role).ToString().ToLower() } catch { 'unknown' }
             $metricVal = try { [int]$net.Metric } catch { 0 }
-
             $stateLabel = if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
 
             $networkItems += [pscustomobject]@{
@@ -209,26 +201,14 @@ function Get-ClusterNetworkData {
             $adapterVal = try { [string]$nic.Adapter } catch { 'unknown' }
 
             $nodeRaw = try { $nic.Node } catch { $null }
-            if ($null -eq $nodeRaw) {
-                $nodeName = 'unknown'
-            }
-            elseif ($nodeRaw -is [string]) {
-                $nodeName = $nodeRaw
-            }
-            else {
-                $nodeName = Read-Prop -Obj $nodeRaw -Names 'Name' -Default 'unknown'
-            }
+            if ($null -eq $nodeRaw) { $nodeName = 'unknown' }
+            elseif ($nodeRaw -is [string]) { $nodeName = $nodeRaw }
+            else { $nodeName = Read-Prop -Obj $nodeRaw -Names 'Name' -Default 'unknown' }
 
             $netRaw = try { $nic.Network } catch { $null }
-            if ($null -eq $netRaw) {
-                $netName = 'unknown'
-            }
-            elseif ($netRaw -is [string]) {
-                $netName = $netRaw
-            }
-            else {
-                $netName = Read-Prop -Obj $netRaw -Names 'Name' -Default 'unknown'
-            }
+            if ($null -eq $netRaw) { $netName = 'unknown' }
+            elseif ($netRaw -is [string]) { $netName = $netRaw }
+            else { $netName = Read-Prop -Obj $netRaw -Names 'Name' -Default 'unknown' }
 
             $stateLabel = if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
 
@@ -353,12 +333,8 @@ function Submit-WSFCMetrics {
             witness_owner_node = Sanitize-TagValue $w.OwnerNode
         }
 
-        if ($wState -eq 'online') {
-            Send-Metric -Name 'wsfc.quorum.witness.health' -Value 1 -Tags $wTags
-        }
-        else {
-            Send-Metric -Name 'wsfc.quorum.witness.health' -Value 0 -Tags $wTags
-        }
+        if ($wState -eq 'online') { Send-Metric -Name 'wsfc.quorum.witness.health' -Value 1 -Tags $wTags }
+        else { Send-Metric -Name 'wsfc.quorum.witness.health' -Value 0 -Tags $wTags }
     }
 
     foreach ($node in $clusterData.Nodes) {
@@ -373,12 +349,8 @@ function Submit-WSFCMetrics {
             node_state   = $stateLabel
         }
 
-        if ($stateCode -eq 0) {
-            Send-Metric -Name 'wsfc.node.health' -Value 1 -Tags $nodeTags
-        }
-        else {
-            Send-Metric -Name 'wsfc.node.health' -Value 0 -Tags $nodeTags
-        }
+        if ($stateCode -eq 0) { Send-Metric -Name 'wsfc.node.health' -Value 1 -Tags $nodeTags }
+        else { Send-Metric -Name 'wsfc.node.health' -Value 0 -Tags $nodeTags }
 
         Send-Metric -Name 'wsfc.node.state'  -Value $stateCode -Tags $nodeTags
         Send-Metric -Name 'wsfc.node.weight'  -Value $nodeWeight -Tags $nodeTags
@@ -397,12 +369,8 @@ function Submit-WSFCMetrics {
             role_state   = $groupStateLabel
         }
 
-        if ($groupStateCode -eq 3) {
-            Send-Metric -Name 'wsfc.role.health' -Value 1 -Tags $groupTags
-        }
-        else {
-            Send-Metric -Name 'wsfc.role.health' -Value 0 -Tags $groupTags
-        }
+        if ($groupStateCode -eq 3) { Send-Metric -Name 'wsfc.role.health' -Value 1 -Tags $groupTags }
+        else { Send-Metric -Name 'wsfc.role.health' -Value 0 -Tags $groupTags }
 
         Send-Metric -Name 'wsfc.role.state' -Value $groupStateCode -Tags $groupTags
     }
@@ -424,12 +392,8 @@ function Submit-WSFCMetrics {
             resource_state = $resStateLabel
         }
 
-        if ($resStateCode -eq 3) {
-            Send-Metric -Name 'wsfc.resource.health' -Value 1 -Tags $resTags
-        }
-        else {
-            Send-Metric -Name 'wsfc.resource.health' -Value 0 -Tags $resTags
-        }
+        if ($resStateCode -eq 3) { Send-Metric -Name 'wsfc.resource.health' -Value 1 -Tags $resTags }
+        else { Send-Metric -Name 'wsfc.resource.health' -Value 0 -Tags $resTags }
 
         Send-Metric -Name 'wsfc.resource.state' -Value $resStateCode -Tags $resTags
     }
@@ -488,10 +452,7 @@ function Submit-WSFCMetrics {
 }
 
 try {
-    if (-not (Test-Prerequisites)) {
-        exit 1
-    }
-
+    if (-not (Test-Prerequisites)) { exit 1 }
     Initialize-DogStatsDClient -Hostname $DogStatsDHost -Port $DogStatsDPort
     Submit-WSFCMetrics -ComputerName $ComputerName
 }
